@@ -29,13 +29,15 @@ This **fusion weight (α)** balances tabular vs. document signals for a robust a
 ## Business Value 
 - 🚀 Saves **time** and **manual effort** for admission teams.  
 - 🎯 Provides **objective, consistent, and explainable** rankings.  
-- 🌍 Scalable across **all universities** — from small colleges to global institutions.  
+- 🌍 Scalable across **all universities** — from small colleges to global institutions.
+
+## For quick testing use the dataset available in data folder( data\samples\sample classification dataset or  data\samples\sample regression dataset) 
+- Use Admit_train_test to train the model 
+- Use Admit_predict to predict applicant's rank
+
 
 ---
 
-##For quick testing use the dataset available in data folder( data\samples\sample classification dataset or  data\samples\sample regression dataset) 
-     - Use Admit_train_test to train the model 
-     - Use Admit_predict to predict applicant's rank
 
 
 🔗 This project demonstrates how **AI + automation** can modernize the admission process and deliver **faster, fairer, and smarter decisions**.
