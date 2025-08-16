@@ -16,7 +16,8 @@ Instead of manually screening thousands of applications, universities can quickl
 - 🤖 **Pluggable ML models** – Any regression/classifier can be used.  
 - 📑 **Document integration** – Link SOP/LOR/CV PDFs to enhance predictions.  
 - 🔝 **Top-K Ranking** – Universities see the best candidates instantly.  
-- 📈 **Visualization** – Probability distributions & student ranking charts.  
+- 📈 **Visualization** – Probability distributions & student ranking charts.
+- Random Seed fixes the train/test split so results are reproducible
 
 ## Alpha Fusion
 We combine:
