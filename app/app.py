@@ -1,516 +1,619 @@
-﻿# app/app.py
+﻿# app.py
+# AdmitRank – Train • Predict • Explain (final)
+
 import io
 import re
 import zipfile
-from typing import Dict, List, Optional, Tuple
+from pathlib import PurePath
+from typing import Dict, Optional, Tuple
 
 import numpy as np
 import pandas as pd
 import streamlit as st
 
 from sklearn.compose import ColumnTransformer
+from sklearn.impute import SimpleImputer
+from sklearn.model_selection import train_test_split
 from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import OneHotEncoder, StandardScaler, LabelEncoder
-from sklearn.impute import SimpleImputer
-from sklearn.feature_extraction.text import TfidfVectorizer
-from sklearn.model_selection import train_test_split
 from sklearn.metrics import (
-    roc_auc_score,
     accuracy_score,
+    roc_auc_score,
     f1_score,
+    r2_score,
     mean_absolute_error,
     mean_squared_error,
-    r2_score,
 )
+from sklearn.inspection import permutation_importance
+
 from sklearn.linear_model import LogisticRegression, LinearRegression
 from sklearn.ensemble import RandomForestClassifier, RandomForestRegressor
+from sklearn.svm import SVC, SVR
 
-# Optional XGBoost if available
 try:
-    from xgboost import XGBClassifier, XGBRegressor  # type: ignore
-    HAS_XGB = True
+    from xgboost import XGBClassifier, XGBRegressor  # optional
+    XGB_OK = True
 except Exception:
-    HAS_XGB = False
+    XGB_OK = False
 
-# PDFs
 try:
-    import PyPDF2
-    HAS_PYPDF2 = True
+    from PyPDF2 import PdfReader
+    PDF_OK = True
 except Exception:
-    HAS_PYPDF2 = False
+    PDF_OK = False
 
 
-# ---------- Page config ----------
-st.set_page_config(
-    page_title="AdmitRank — Train • Predict • Explain",
-    layout="wide",
-    page_icon="🎓",
-)
+# ------------------------------
+# ---------- Utilities ----------
+# ------------------------------
+st.set_page_config(page_title="AdmitRank — Train • Predict • Explain", layout="wide")
 
-# ---------- Helpers ----------
-
-def read_csv(upload) -> pd.DataFrame:
+def read_table(upload) -> pd.DataFrame:
+    """Robust CSV/Excel reader for Streamlit UploadedFile with buffer rewind."""
     if upload is None:
         return pd.DataFrame()
-    return pd.read_csv(upload)
-
-def _avg_len(s: pd.Series) -> float:
+    # Always rewind the buffer
     try:
-        return float(np.nanmean(s.astype(str).str.len()))
+        upload.seek(0)
     except Exception:
-        return 0.0
+        pass
 
-def detect_id_column(df: pd.DataFrame) -> str:
-    cand = ["Serial No.", "serial_no", "applicant_id", "id", "ID"]
-    for c in cand:
-        if c in df.columns:
-            return c
-    # fallback: first column
-    return df.columns[0]
-
-def detect_task(y: pd.Series) -> Tuple[str, bool]:
-    """
-    Returns ("classification" or "regression", is_binary_bool)
-    """
-    # string targets -> treat as classification
-    if y.dtype == "object":
-        uniq = y.dropna().unique()
-        return ("classification", len(uniq) == 2)
-    # numeric
-    uniq = pd.unique(y.dropna())
-    if len(uniq) <= 10:
-        return ("classification", len(uniq) == 2)
-    return ("regression", False)
-
-def split_feature_types(df: pd.DataFrame, features: List[str]) -> Tuple[List[str], List[str], Optional[str]]:
-    """
-    Separate numeric, categorical, text.
-    We auto-detect "long" text columns (avg length > ~25 or very high cardinality)
-    and collapse them into a single TEXT_ALL column.
-    """
-    num_cols = []
-    cat_cols = []
-    text_cols = []
-    for c in features:
-        if pd.api.types.is_numeric_dtype(df[c]):
-            num_cols.append(c)
-        elif pd.api.types.is_datetime64_any_dtype(df[c]):
-            # treat as categorical for simplicity
-            cat_cols.append(c)
-        else:
-            avglen = _avg_len(df[c])
-            nunique = df[c].nunique(dropna=True)
-            # heuristic: longer strings or very high cardinality -> text
-            if avglen >= 25 or nunique > max(30, 0.5 * len(df[c])):
-                text_cols.append(c)
-            else:
-                cat_cols.append(c)
-
-    text_all_name = None
-    if len(text_cols) > 0:
-        text_all_name = "TEXT_ALL"
-    return num_cols, cat_cols, text_all_name
-
-def add_text_all(df: pd.DataFrame, text_cols: List[str]) -> pd.DataFrame:
-    if not text_cols:
+    # Try CSV first
+    try:
+        df = pd.read_csv(upload, engine="python")
         return df
-    dfx = df.copy()
-    dfx["TEXT_ALL"] = dfx[text_cols].astype(str).agg(" . ".join, axis=1)
-    return dfx
+    except pd.errors.EmptyDataError:
+        # Fall through to Excel attempt
+        pass
+    except Exception:
+        pass
 
-def build_preprocess_and_model(
-    df: pd.DataFrame,
-    target: str,
-    id_col: str,
-    model_family: str = "RandomForest",
-    num_impute: str = "median",
-    cat_impute: str = "most_frequent",
-) -> Tuple[Pipeline, Dict]:
-    """
-    Builds and fits a pipeline on df (train split inside),
-    stores metadata (feature types, label encoder when needed).
-    """
-    # features = all columns except id_col + target
-    base_features = [c for c in df.columns if c not in [id_col, target]]
+    # Rewind and try Excel
+    try:
+        upload.seek(0)
+        df = pd.read_excel(upload)
+        return df
+    except Exception:
+        return pd.DataFrame()
 
-    num_cols, cat_cols, text_all_name = split_feature_types(df, base_features)
-    text_cols = []
-    # if have text_all
-    if text_all_name:
-        # identify source text columns
-        text_cols = [
-            c for c in base_features
-            if (c not in num_cols and c not in cat_cols)
-        ]
-        df = add_text_all(df, text_cols)
 
-    X = df[[c for c in base_features if c in (num_cols + cat_cols)]].copy()
-    if text_all_name:
-        X[text_all_name] = df[text_all_name]
+def is_binary_series(s: pd.Series) -> bool:
+    vals = pd.Series(s.dropna().unique())
+    if len(vals) <= 1:
+        return False
+    if vals.dtype.kind in "ifb":
+        # treat as binary if only two distinct numbers (e.g., 0/1)
+        return len(vals) == 2
+    # strings like YES/NO
+    v = vals.astype(str).str.upper().str.strip()
+    return len(v.unique()) == 2
 
-    y = df[target].copy()
 
-    task, is_binary = detect_task(y)
+def infer_task(y: pd.Series) -> str:
+    """Return 'classification' or 'regression'."""
+    y_clean = y.dropna()
+    # Common patterns for classification
+    if y_clean.dtype.kind in "b":
+        return "classification"
+    if y_clean.dtype.kind in "if" and len(y_clean.unique()) <= 10:
+        # small finite set of numbers often indicates classes
+        return "classification"
+    if y_clean.dtype.kind in "O":
+        return "classification"
+    # otherwise
+    return "regression"
 
-    # encode y for classification if categorical
-    label_encoder = None
-    if task == "classification" and y.dtype == "object":
-        label_encoder = LabelEncoder()
-        y = label_encoder.fit_transform(y.astype(str))
 
-    # build preprocess
-    transformers = []
-    if num_cols:
-        transformers.append(
-            ("num", Pipeline([
-                ("imp", SimpleImputer(strategy=num_impute)),
-                ("scaler", StandardScaler()),
-            ]), num_cols)
-        )
-    if cat_cols:
-        transformers.append(
-            ("cat", Pipeline([
-                ("imp", SimpleImputer(strategy=cat_impute)),
-                ("oh", OneHotEncoder(handle_unknown="ignore")),
-            ]), cat_cols)
-        )
-    if text_all_name:
-        transformers.append(
-            ("txt", Pipeline([
-                # missing -> empty string
-                ("imp", SimpleImputer(strategy="constant", fill_value="")),
-                ("tfidf", TfidfVectorizer(min_df=2, ngram_range=(1, 2), max_features=5000)),
-            ]), text_all_name)
-        )
-
-    pre = ColumnTransformer(transformers, remainder="drop")
-
-    # choose estimator
+def build_estimator(task: str, family: str):
+    """Return an (estimator, needs_scaling) tuple."""
+    family = family.lower()
     if task == "classification":
-        if model_family == "Linear":
-            est = LogisticRegression(max_iter=2000, n_jobs=None)
-        elif model_family == "XGBoost" and HAS_XGB:
-            est = XGBClassifier(
-                n_estimators=300, max_depth=4, learning_rate=0.05,
-                subsample=0.9, colsample_bytree=0.8, reg_lambda=1.0,
+        if family == "linear":
+            return LogisticRegression(max_iter=200, n_jobs=None), True
+        if family == "tree":
+            return RandomForestClassifier(n_estimators=300, random_state=42), False
+        if family == "svm":
+            return SVC(probability=True, kernel="rbf"), True
+        if family == "xgboost" and XGB_OK:
+            return XGBClassifier(
+                n_estimators=300,
+                learning_rate=0.05,
+                max_depth=5,
+                subsample=0.9,
+                colsample_bytree=0.9,
+                random_state=42,
                 eval_metric="logloss",
-            )
-        else:
-            est = RandomForestClassifier(n_estimators=400, random_state=42)
-    else:  # regression
-        if model_family == "Linear":
-            est = LinearRegression()
-        elif model_family == "XGBoost" and HAS_XGB:
-            est = XGBRegressor(
-                n_estimators=400, max_depth=4, learning_rate=0.05,
-                subsample=0.9, colsample_bytree=0.8, reg_lambda=1.0,
-            )
-        else:
-            est = RandomForestRegressor(n_estimators=400, random_state=42)
+            ), False
+        # fallback
+        return LogisticRegression(max_iter=200), True
 
-    pipe = Pipeline([("pre", pre), ("est", est)])
+    # regression
+    if family == "linear":
+        return LinearRegression(), True
+    if family == "tree":
+        return RandomForestRegressor(n_estimators=300, random_state=42), False
+    if family == "svm":
+        return SVR(kernel="rbf"), True
+    if family == "xgboost" and XGB_OK:
+        return XGBRegressor(
+            n_estimators=300,
+            learning_rate=0.05,
+            max_depth=5,
+            subsample=0.9,
+            colsample_bytree=0.9,
+            random_state=42,
+        ), False
+    return RandomForestRegressor(n_estimators=300, random_state=42), False
 
-    # train/val split for a quick score
-    X_train, X_test, y_train, y_test = train_test_split(
-        X, y, test_size=0.1, random_state=42, stratify=y if task == "classification" else None
+
+def split_train_eval(
+    df: pd.DataFrame,
+    features: list,
+    target: str,
+    family: str,
+    test_size: float = 0.1,
+    random_state: int = 42,
+):
+    """Train/test split + pipeline training + basic metrics + permutation importances."""
+    y = df[target]
+    task = infer_task(y)
+
+    # Prepare label encoder if classification & non-numeric labels
+    le = None
+    y_train = y.copy()
+    if task == "classification" and y_train.dtype.kind not in "ifb":
+        le = LabelEncoder()
+        y_train = le.fit_transform(y_train.astype(str))
+
+    X = df[features].copy()
+    # Identify types
+    num_cols = [c for c in X.columns if pd.api.types.is_numeric_dtype(X[c])]
+    cat_cols = [c for c in X.columns if c not in num_cols]
+
+    est, needs_scaling = build_estimator(task, family)
+
+    num_pipe = [("imputer", SimpleImputer(strategy="median"))]
+    if needs_scaling:
+        num_pipe.append(("scaler", StandardScaler()))
+    num_pipe = Pipeline(num_pipe)
+
+    cat_pipe = Pipeline(
+        [
+            ("imputer", SimpleImputer(strategy="most_frequent")),
+            ("ohe", OneHotEncoder(handle_unknown="ignore")),
+        ]
     )
-    pipe.fit(X_train, y_train)
 
-    # metrics
+    pre = ColumnTransformer(
+        transformers=[("num", num_pipe, num_cols), ("cat", cat_pipe, cat_cols)],
+        remainder="drop",
+    )
+
+    pipe = Pipeline(
+        [
+            ("pre", pre),
+            ("model", est),
+        ]
+    )
+
+    stratify = y_train if task == "classification" else None
+    X_tr, X_te, y_tr, y_te = train_test_split(
+        X, y_train, test_size=test_size, random_state=random_state, stratify=stratify
+    )
+
+    pipe.fit(X_tr, y_tr)
+    y_pred = pipe.predict(X_te)
+
     metrics = {}
     if task == "classification":
-        prob = pipe.predict_proba(X_test)[:, 1]
-        pred = (prob >= 0.5).astype(int)
+        # proba if available
         try:
-            metrics["ROC_AUC"] = float(roc_auc_score(y_test, prob))
+            proba = pipe.predict_proba(X_te)[:, -1]
         except Exception:
-            metrics["ROC_AUC"] = float("nan")
-        metrics["Accuracy"] = float(accuracy_score(y_test, pred))
-        metrics["F1"] = float(f1_score(y_test, pred))
+            proba = None
+        metrics["Accuracy"] = accuracy_score(y_te, y_pred)
+        if proba is not None and len(np.unique(y_te)) == 2:
+            metrics["ROC-AUC"] = roc_auc_score(y_te, proba)
+        metrics["F1"] = f1_score(y_te, y_pred, average="weighted")
     else:
-        pred = pipe.predict(X_test)
-        metrics["MAE"] = float(mean_absolute_error(y_test, pred))
-        metrics["RMSE"] = float(np.sqrt(mean_squared_error(y_test, pred)))
-        metrics["R2"] = float(r2_score(y_test, pred))
+        metrics["R2"] = r2_score(y_te, y_pred)
+        metrics["MAE"] = mean_absolute_error(y_te, y_pred)
+        metrics["RMSE"] = np.sqrt(mean_squared_error(y_te, y_pred))
 
-    meta = dict(
-        id_col=id_col,
-        target=target,
-        task=task,
-        is_binary=is_binary,
-        num_cols=num_cols,
-        cat_cols=cat_cols,
-        text_cols=text_cols,    # original long text cols used to build TEXT_ALL
-        text_all_name="TEXT_ALL" if text_cols else None,
-        model_family=model_family,
-        label_encoder=label_encoder,
-        metrics=metrics,
-    )
-    return pipe, meta
+    # Permutation importance
+    imp_df = pd.DataFrame()
+    try:
+        perm = permutation_importance(pipe, X_te, y_te, n_repeats=5, random_state=42)
+        # Build feature names after OHE automatically; but it's tricky to map.
+        # Instead, compute importance on original features by permuting columns manually:
+        # Simpler: show model-agnostic "drop-column" style using permutation_importance on original data
+        # However ColumnTransformer makes mapping complex. We'll just show raw importances from permutation.
+        # We'll aggregate importances per original column by permuting each col alone:
+        agg_importance = []
+        for col in X.columns:
+            X_te_perm = X_te.copy()
+            X_te_perm[col] = np.random.permutation(X_te_perm[col].values)
+            score_base = pipe.score(X_te, y_te)
+            score_perm = pipe.score(X_te_perm, y_te)
+            agg_importance.append((col, score_base - score_perm))
+        imp_df = pd.DataFrame(agg_importance, columns=["feature", "importance"]).sort_values(
+            "importance", ascending=False
+        )
+    except Exception:
+        pass
+
+    # For returning p scaling in regression
+    y_min, y_max = None, None
+    if task == "regression":
+        y_min = float(pd.Series(y).min())
+        y_max = float(pd.Series(y).max())
+
+    model_pack = {
+        "pipeline": pipe,
+        "task": task,
+        "family": family,
+        "label_encoder": le,
+        "features": features,
+        "target": target,
+        "y_min": y_min,
+        "y_max": y_max,
+    }
+    return model_pack, metrics, imp_df
 
 
-def pdf_to_text(file_bytes: bytes) -> str:
-    if not HAS_PYPDF2:
+def ensure_model() -> bool:
+    ok = all(k in st.session_state for k in ("model", "fitted"))
+    return ok
+
+
+def safe_int(x) -> Optional[int]:
+    try:
+        return int(x)
+    except Exception:
+        return None
+
+
+def extract_id_from_name(name: str) -> Optional[str]:
+    """
+    Accept <id>_<TYPE>.pdf (extension optional).
+    Returns the <id> as string if found, else None.
+    """
+    base = PurePath(name).name
+    # allow ".pdf" optional
+    m = re.match(r"^([^_]+)_(SOP|LOR\d*|CV)(?:\.[pP][dD][fF])?$", base)
+    if not m:
+        return None
+    return m.group(1)
+
+
+def pdf_to_text(pdf_bytes: bytes) -> str:
+    if not PDF_OK:
         return ""
     try:
-        reader = PyPDF2.PdfReader(io.BytesIO(file_bytes))
-        chunks = []
+        reader = PdfReader(io.BytesIO(pdf_bytes))
+        txt = []
         for page in reader.pages:
-            chunks.append(page.extract_text() or "")
-        return "\n".join(chunks)
+            try:
+                txt.append(page.extract_text() or "")
+            except Exception:
+                continue
+        return "\n".join(txt)
     except Exception:
         return ""
 
-def score_text_simple(text: str) -> float:
+
+def simple_doc_score(text: str) -> float:
     """
-    Very light doc score in [0,1]:
-    - normalize length
-    - bonus for keywords
+    Very lightweight quality proxy in [0, 1]:
+      - length (characters),
+      - vocabulary richness (unique words / total words).
     """
     if not text:
         return 0.0
-    t = text.strip()
-    n = len(t)
-    # normalize length ~2k chars good enough
-    length_score = min(n / 2000.0, 1.0)
-    kw = ["research", "intern", "publication", "project", "award", "experience"]
-    kw_hits = sum(int(k in t.lower()) for k in kw)
-    kw_score = min(kw_hits / 5.0, 1.0)
-    return 0.7 * length_score + 0.3 * kw_score
+    chars = len(text)
+    words = re.findall(r"[A-Za-z']+", text)
+    total_words = max(1, len(words))
+    unique_words = len(set(w.lower() for w in words))
+    richness = unique_words / total_words  # 0..1
 
-PDF_REGEX = re.compile(r"^(\d+)[^/\\]*_(SOP|LOR\d*|CV)(?:\.\w+)?$", re.IGNORECASE)
+    # Length normalization (capped at ~1500 chars)
+    length_score = min(1.0, chars / 1500.0)
 
-def build_doc_index_from_zip(zip_file: Optional[io.BytesIO]) -> Dict[str, float]:
+    # Combine
+    score = 0.6 * length_score + 0.4 * richness
+    return float(np.clip(score, 0, 1))
+
+
+def build_doc_index_from_zip(upload_zip) -> Dict[str, float]:
     """
-    Returns {id_str: score_in_[0,1]}.
-    Tolerant to any missing PDFs; unknown files ignored.
+    Parse ZIP of PDFs and compute mean doc score per id.
+    Missing/invalid files are ignored gracefully.
     """
-    if zip_file is None:
+    if upload_zip is None:
         return {}
-    idx: Dict[str, List[float]] = {}
     try:
-        with zipfile.ZipFile(zip_file) as zf:
+        upload_zip.seek(0)
+    except Exception:
+        pass
+
+    try:
+        with zipfile.ZipFile(upload_zip) as zf:
+            scores: Dict[str, list] = {}
             for name in zf.namelist():
-                base = name.split("/")[-1]
-                m = PDF_REGEX.match(base)
-                if not m:
+                id_ = extract_id_from_name(name)
+                if id_ is None:
                     continue
-                key = m.group(1)  # applicant id as string
-                data = zf.read(name)
-                txt = pdf_to_text(data)
-                sc = score_text_simple(txt)
-                idx.setdefault(key, []).append(sc)
+                try:
+                    data = zf.read(name)
+                except Exception:
+                    continue
+                text = pdf_to_text(data)
+                s = simple_doc_score(text)
+                scores.setdefault(id_, []).append(s)
+            # average per id
+            return {k: float(np.mean(v)) for k, v in scores.items() if v}
     except Exception:
         return {}
-    # average per id
-    out: Dict[str, float] = {}
-    for k, vals in idx.items():
-        if len(vals) == 0:
-            continue
-        out[k] = float(np.mean(vals))
-    return out
 
 
-def predict_on_new(
-    pipe: Pipeline,
-    meta: Dict,
-    df_pred_raw: pd.DataFrame,
-    doc_idx: Dict[str, float],
-    alpha: float,
-    group_col: Optional[str],
-    top_k: int,
-) -> Tuple[pd.DataFrame, pd.DataFrame]:
+def proba_from_model(model_pack: dict, df_pred: pd.DataFrame) -> np.ndarray:
     """
-    Returns (scored_prediction_dataframe, top_k_dataframe)
-    Scoring uses only df_pred_raw (no training rows).
+    Return an array of probabilities/scores in [0, 1] for the *prediction set only*.
+    Binary classification: positive class probability.
+    Regression: min-max scale predictions using train target range.
     """
-    id_col = meta["id_col"]
-    target = meta["target"]
-    task = meta["task"]
-    text_cols = meta["text_cols"]
-    text_all_name = meta["text_all_name"]
+    pipe = model_pack["pipeline"]
+    features = model_pack["features"]
+    task = model_pack["task"]
+    y_min = model_pack.get("y_min", None)
+    y_max = model_pack.get("y_max", None)
 
-    # Remove target if user accidentally included it in prediction file
-    df_pred = df_pred_raw.copy()
-    if target in df_pred.columns:
-        df_pred = df_pred.drop(columns=[target])
-
-    # Build TEXT_ALL if we used text during training
-    if text_all_name:
-        to_join = [c for c in text_cols if c in df_pred.columns]
-        df_pred = add_text_all(df_pred, to_join)
-
-    # X columns = everything except id_col (and no target col since removed)
-    X_cols = [c for c in df_pred.columns if c != id_col]
-
-    # tabular score
-    if meta["task"] == "classification":
-        p_tab = pipe.predict_proba(df_pred[X_cols])[:, 1]
+    Xp = df_pred[features].copy()
+    if task == "classification":
+        try:
+            proba = pipe.predict_proba(Xp)[:, -1]
+        except Exception:
+            # fallback: decision_function -> sigmoid-ish
+            try:
+                d = pipe.decision_function(Xp)
+                proba = 1 / (1 + np.exp(-d))
+            except Exception:
+                proba = pipe.predict(Xp)
+                # force to [0,1]
+                proba = (proba - np.min(proba)) / (np.ptp(proba) + 1e-9)
+        return np.clip(proba, 0, 1)
     else:
-        # For regression, normalize to [0,1] via min-max on predictions
-        y_hat = pipe.predict(df_pred[X_cols])
-        # guard degenerate case
-        y_min, y_max = float(np.min(y_hat)), float(np.max(y_hat))
-        if y_max > y_min:
-            p_tab = (y_hat - y_min) / (y_max - y_min)
+        pred = pipe.predict(Xp).astype(float)
+        # normalize to 0..1 using training range if available
+        if y_min is None or y_max is None or y_max <= y_min:
+            mn, mx = float(np.min(pred)), float(np.max(pred))
         else:
-            p_tab = np.zeros_like(y_hat, dtype=float)
-
-    # doc score from PDFs if available
-    ids_as_str = df_pred[id_col].astype(str)
-    p_doc = np.array([doc_idx.get(s, np.nan) for s in ids_as_str], dtype=float)
-
-    # fusion
-    p_final = p_tab.copy()
-    mask = ~np.isnan(p_doc)
-    p_final[mask] = alpha * p_tab[mask] + (1 - alpha) * p_doc[mask]
-
-    scored = df_pred.copy()
-    scored["p_tabular"] = p_tab
-    scored["doc_score"] = p_doc
-    scored["p_final"]  = p_final
-
-    # sort by p_final (descending)
-    scored_sorted = scored.sort_values("p_final", ascending=False)
-
-    # Top-K overall or by group (always from prediction df only)
-    if group_col and group_col in scored_sorted.columns:
-        topk = (
-            scored_sorted
-            .groupby(group_col, group_keys=False)
-            .head(top_k)
-        )
-    else:
-        topk = scored_sorted.head(top_k)
-
-    return scored_sorted, topk
+            mn, mx = float(y_min), float(y_max)
+        proba = (pred - mn) / (max(1e-9, mx - mn))
+        return np.clip(proba, 0, 1)
 
 
-# ---------- UI ----------
-
-st.title("AdmitRank — Train • Predict • Explain")
-st.write(
-    "Upload any **historical CSV** to **train**, then predict on a **new CSV**. "
-    "Optionally add a **ZIP of SOP/LOR/CV PDFs** named like "
-    "`1234_SOP.pdf`, `1234_LOR1.pdf`, `1234_CV.pdf` "
-    "(**extension is optional**). Missing PDFs are fine — we simply use the tabular score."
+# ------------------------------
+# --------- Page Header --------
+# ------------------------------
+st.markdown(
+    """
+    <h1 style="margin-bottom:0">AdmitRank — Train • Predict • Explain</h1>
+    <p style="color:#aaa">
+      Upload any <b>historical CSV</b> to <b>train</b>, then predict on a <b>new CSV</b>.
+      Optionally add a ZIP of SOP/LOR/CV PDFs named like
+      <code>1234_SOP.pdf</code>, <code>1234_LOR1.pdf</code>, <code>1234_CV.pdf</code>
+      (extension is optional).
+      <br/>Missing PDFs are OK — the system will simply use the tabular model.
+    </p>
+    """,
+    unsafe_allow_html=True,
 )
 
 tab_train, tab_predict = st.tabs(["Train", "Predict"])
 
-
-# --------- TRAIN TAB ----------
+# ------------------------------
+# ----------- TRAIN ------------
+# ------------------------------
 with tab_train:
     st.subheader("Train a model")
 
-    train_csv = st.file_uploader("Upload historical training CSV", type=["csv"], key="train_csv")
-    df_train = read_csv(train_csv)
+    hist_upload = st.file_uploader(
+        "Upload historical training CSV",
+        type=["csv", "xlsx", "xls"],
+        key="hist_csv",
+        help="This is the dataset used to fit the model.",
+    )
 
-    if not df_train.empty:
-        st.caption("Preview (first 6 rows)")
-        st.dataframe(df_train.head(6), use_container_width=True)
+    if hist_upload is not None:
+        df_hist = read_table(hist_upload)
+        if df_hist.empty:
+            st.error("Could not read the uploaded file. Please check the format.")
+        else:
+            st.dataframe(df_hist.head(), use_container_width=True)
+            # Choose target and features
+            cols = list(df_hist.columns)
+            target = st.selectbox("Target column", options=cols, index=len(cols) - 1)
+            feature_default = [c for c in cols if c != target]
+            features = st.multiselect(
+                "Feature columns",
+                options=cols,
+                default=feature_default,
+                help="Choose the columns you want to use as features.",
+            )
+            st.caption("Tip: You can include categorical columns; they'll be one-hot encoded automatically.")
 
-        id_col_default = detect_id_column(df_train)
-        id_col = st.selectbox("ID column (matches PDFs)", options=list(df_train.columns), index=list(df_train.columns).index(id_col_default))
+            colA, colB, colC = st.columns([1, 1, 1])
+            with colA:
+                family = st.selectbox("Model family", options=["Linear", "Tree", "SVM", "XGBoost" if XGB_OK else "Linear"])
+            with colB:
+                test_size = st.slider("Test size (hold-out)", 0.05, 0.3, 0.10, 0.05)
+            with colC:
+                random_state = st.number_input("Random seed", 0, 9999, 42)
 
-        target = st.selectbox("Target column", options=[c for c in df_train.columns if c != id_col])
+            if st.button("Train", type="primary", use_container_width=False):
+                if not features:
+                    st.warning("Please select at least one feature.")
+                else:
+                    model_pack, metrics, imp_df = split_train_eval(
+                        df_hist, features, target, family, test_size=test_size, random_state=random_state
+                    )
+                    st.session_state["model"] = model_pack
+                    st.session_state["fitted"] = True
 
-        # Feature selection (default = all except id and target)
-        default_feats = [c for c in df_train.columns if c not in [id_col, target]]
-        features = st.multiselect("Feature columns", options=[c for c in df_train.columns if c not in [id_col, target]],
-                                  default=default_feats)
+                    st.success("Model trained and stored in session. You can switch to the Predict tab now.")
 
-        col1, col2, col3 = st.columns(3)
-        with col1:
-            model_family = st.selectbox("Model family", ["RandomForest", "Linear"] + (["XGBoost"] if HAS_XGB else []))
-        with col2:
-            num_strategy = st.selectbox("Numeric imputation", ["median", "mean"])
-        with col3:
-            cat_strategy = st.selectbox("Categorical imputation", ["most_frequent", "constant"])
+                    st.markdown("### Validation metrics")
+                    mcols = st.columns(len(metrics) or 1)
+                    for (k, v), c in zip(metrics.items(), mcols):
+                        with c:
+                            st.metric(k, f"{v:.4f}")
 
-        if st.button("Train", type="primary"):
-            # keep only selected columns
-            df_sub = df_train[[id_col, target] + features].copy()
+                    # Simple target distribution
+                    st.markdown("### Target distribution")
+                    with st.container():
+                        if infer_task(df_hist[target]) == "classification":
+                            counts = df_hist[target].value_counts()
+                            st.bar_chart(counts, use_container_width=True)
+                        else:
+                            st.histogram(df_hist[target], bins=30, use_container_width=True)
 
-            with st.spinner("Training..."):
-                pipe, meta = build_preprocess_and_model(
-                    df_sub,
-                    target=target,
-                    id_col=id_col,
-                    model_family=model_family,
-                    num_impute=num_strategy,
-                    cat_impute=cat_strategy,
-                )
-
-            # keep in session
-            st.session_state.model = pipe
-            st.session_state.meta = meta
-
-            st.success("Model trained and stored in session.")
-            st.write("**Detected task:**", meta["task"])
-            st.write("**Validation metrics (10% split):**")
-            st.json(meta["metrics"])
-
-            # Quick visualizations (train split metrics already above)
-            st.markdown("### Feature snapshot")
-            st.bar_chart(df_train[features].select_dtypes(include=np.number).head(200))
-
-    else:
-        st.info("Upload a training CSV to begin.")
+                    # Feature importances
+                    if not imp_df.empty:
+                        st.markdown("### Feature importance (permutation) — higher is better")
+                        st.dataframe(imp_df, use_container_width=True)
+                        st.bar_chart(
+                            imp_df.set_index("feature").head(15),
+                            use_container_width=True,
+                        )
 
 
-# --------- PREDICT TAB ----------
+# ------------------------------
+# ---------- PREDICT -----------
+# ------------------------------
 with tab_predict:
     st.subheader("Predict on a new applicants CSV")
 
-    if "model" not in st.session_state or "meta" not in st.session_state:
-        st.warning("Train a model on the **Train** tab first.")
-        st.stop()
-
-    model = st.session_state.model
-    meta = st.session_state.meta
-    id_col_trained = meta["id_col"]
-
-    pred_csv = st.file_uploader("Upload prediction CSV", type=["csv"], key="pred_csv")
-    zip_docs = st.file_uploader("Optional: ZIP of SOP/LOR/CV PDFs", type=["zip"])
-
-    alpha = st.slider("Fusion weight α (tabular vs doc)", min_value=0.0, max_value=1.0, value=0.7, step=0.05)
-    top_k = st.number_input("Top-K overall", min_value=1, max_value=1000, value=5, step=1)
-    group_col = st.selectbox("Optional: return Top-K per group (choose a column or leave blank)", options=[""] + ([] if pred_csv is None else list(read_csv(pred_csv).columns)))
-    group_col = None if group_col == "" else group_col
-
-    if pred_csv is not None:
-        df_pred = read_csv(pred_csv)
-
-        if id_col_trained not in df_pred.columns:
-            st.error(f"Your prediction CSV must contain the ID column used during training: **{id_col_trained}**.")
-            st.stop()
-
-        st.caption("Prediction file (first 6 rows)")
-        st.dataframe(df_pred.head(6), use_container_width=True)
-
-        if st.button("Run prediction", type="primary"):
-            with st.spinner("Scoring..."):
-                # Build doc index (tolerant to missing/partial ZIP)
-                doc_idx = build_doc_index_from_zip(zip_docs)
-
-                scored, topk = predict_on_new(
-                    model, meta, df_pred, doc_idx, alpha, group_col, int(top_k)
-                )
-
-            # Small distribution viz
-            st.markdown("### Score distribution (p_final)")
-            st.bar_chart(pd.Series(np.round(scored["p_final"], 2)).value_counts().sort_index())
-
-            st.markdown("### Predictions (with fusion & Top-K)")
-            st.dataframe(topk[[c for c in topk.columns if c not in ["TEXT_ALL"]]], use_container_width=True)
-
-            st.markdown("### Download scored predictions")
-            st.download_button(
-                label="Download full scored CSV",
-                data=scored.to_csv(index=False).encode("utf-8"),
-                file_name="scored_predictions.csv",
-                mime="text/csv",
-            )
+    if not ensure_model():
+        st.info("Train a model in the **Train** tab first.")
     else:
-        st.info("Upload a prediction CSV to score new applicants.")
+        model_pack = st.session_state["model"]
+        features = model_pack["features"]
+        target = model_pack["target"]
+
+        st.markdown(
+            f"**This model expects the following features:** `{', '.join(features)}`"
+        )
+
+        pred_upload = st.file_uploader(
+            "Upload new applicants CSV",
+            type=["csv", "xlsx", "xls"],
+            key="pred_csv",
+        )
+
+        col1, col2 = st.columns([2, 1])
+        with col1:
+            zip_upload = st.file_uploader(
+                "Optional: Upload a ZIP with SOP/LOR/CV PDFs (named like 1234_SOP.pdf, 1234_LOR1.pdf, 1234_CV.pdf). Missing files are fine.",
+                type=["zip"],
+                key="docs_zip",
+            )
+        with col2:
+            alpha = st.slider("Fusion weight α (tabular vs doc)", 0.0, 1.0, 0.3, 0.05,
+                             help="p_final = α·p_tabular + (1−α)·doc_score")
+
+        # Read once & reuse
+        df_pred = read_table(pred_upload) if pred_upload is not None else pd.DataFrame()
+
+        if not df_pred.empty:
+            st.markdown("#### Preview (first 10 rows)")
+            st.dataframe(df_pred.head(10), use_container_width=True)
+
+            # Identify id column for doc matching
+            # Heuristics: choose a numeric/integer column or an 'id' look-alike
+            id_candidates = [c for c in df_pred.columns if re.search(r"id|serial", c, re.I)]
+            if not id_candidates:
+                # try to find a unique-ish numeric integer column
+                for c in df_pred.columns:
+                    if pd.api.types.is_integer_dtype(df_pred[c]) and df_pred[c].nunique() == len(df_pred):
+                        id_candidates.append(c)
+            id_col = st.selectbox(
+                "Key column for matching docs (the <id> part in 1234_SOP.pdf)",
+                options=id_candidates if id_candidates else list(df_pred.columns),
+            )
+
+            # Group for optional Top-K per group
+            group_options = [""] + list(df_pred.columns)
+            k_group = st.selectbox("Optional: return Top-K per group (choose a column or leave blank)", options=group_options)
+            group_col = None if k_group == "" else k_group
+
+            k_value = st.number_input("K per group (or overall if no group)", 1, 500, 5)
+
+            # Compute tabular proba strictly from prediction set
+            try:
+                p_tabular = proba_from_model(model_pack, df_pred)
+            except Exception as e:
+                st.error(f"Could not score the prediction data with the trained model. {e}")
+                st.stop()
+
+            # Compute doc index if ZIP provided
+            doc_index = build_doc_index_from_zip(zip_upload) if zip_upload is not None else {}
+
+            # Derive doc score vector on df_pred order (tolerant to missing)
+            ids_as_str = df_pred[id_col].astype(str).fillna("")
+            doc_scores = np.array([doc_index.get(_id, np.nan) for _id in ids_as_str])
+            doc_scores_nan_to_zero = np.nan_to_num(doc_scores, nan=np.nan)  # keep NaN for display, but later handle fusion
+
+            # Fusion
+            # If doc score is NaN -> use tabular only for that row: p_final = p_tabular
+            p_final = p_tabular.copy()
+            if np.isfinite(doc_scores).any():
+                ds = np.where(np.isfinite(doc_scores), doc_scores, p_tabular)
+                p_final = alpha * p_tabular + (1 - alpha) * ds
+
+            # Build result frame (prediction set only)
+            out = df_pred.copy()
+            out["p_tabular"] = p_tabular
+            out["doc_score"] = [None if not np.isfinite(v) else float(v) for v in doc_scores]
+            out["p_final"] = p_final
+
+            # ----------------- Visualizations -----------------
+            st.markdown("### Probability distribution on prediction set")
+            st.histogram(out["p_final"], bins=20, use_container_width=True)
+
+            # ----------------- Top-K selection -----------------
+            st.markdown("### Top-K applicants")
+
+            if group_col is None:
+                # Overall Top-K using p_final
+                topk = out.sort_values("p_final", ascending=False).head(int(k_value))
+                st.dataframe(topk, use_container_width=True)
+            else:
+                # Per group
+                def take_topk(g):
+                    return g.sort_values("p_final", ascending=False).head(int(k_value))
+
+                grp = out.groupby(group_col, group_keys=False)
+                topk = grp.apply(take_topk)
+                st.dataframe(topk, use_container_width=True)
+
+            # Summaries by group (optional)
+            st.markdown("### Optional: Mean p_final by group")
+            if group_col is None:
+                mean_pf = out["p_final"].mean()
+                st.write(f"Mean p_final (overall): **{mean_pf:.4f}**")
+            else:
+                gp = out.groupby(group_col)["p_final"].mean().sort_values(ascending=False)
+                st.bar_chart(gp, use_container_width=True)
+
+        else:
+            st.info("Upload a prediction CSV to score applicants.")
+
+
+# ------------------------------
+# --------- Footer note --------
+# ------------------------------
+st.caption(
+    "Built to be robust and simple: tolerant to missing PDFs, uses only the prediction set for Top-K, "
+    "and provides lightweight, fast visualizations."
+)
