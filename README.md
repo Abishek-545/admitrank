@@ -1,25 +1,5 @@
-
 # AdmitRank — Train • Predict • Explain
-sequenceDiagram
-    participant User
-    participant Trainer as Trainer (app)
-    participant Model as Trained Model
-    participant Docs as PDF Parser
-    participant Ranker as Top-K & Viz
 
-    User->>Trainer: Upload training.csv\n+ select target/features
-    Trainer->>Trainer: Split with Random Seed\n(hold-out test)
-    Trainer->>Model: Fit pipeline (impute/encode/scale + estimator)
-    Model-->>Trainer: Metrics (acc/ROC-AUC/RMSE...)
-    Trainer-->>User: Train report\n+ saved pipeline & schema
-
-    User->>Trainer: Upload predict.csv\n(+ optional ZIP PDFs)
-    Trainer->>Model: Predict p_tabular
-    Trainer->>Docs: Extract doc_score_i (missing → None)
-    Docs-->>Trainer: doc_score_i per row
-    Trainer->>Trainer: Fuse p_final = α·p_tabular + (1−α)·doc_score
-    Trainer->>Ranker: Filter to prediction set only\nthen sort by p_final
-    Ranker-->>User: Top-K table + charts\n+ downloadable CSV
 📌 [Live App Link](#)  https://admitrank-dacysgdughauxleskuuend.streamlit.app/
 ## Overview
 AdmitRank is the **first-ever novel business solution** for universities to automate student admission ranking.  
