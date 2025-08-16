@@ -1,0 +1,15 @@
+# Python
+__pycache__/
+*.pyc
+.venv/
+env/
+venv/
+
+# Data & artifacts
+data/
+*.pkl
+*.joblib
+
+# OS/editor
+.DS_Store
+Thumbs.db
