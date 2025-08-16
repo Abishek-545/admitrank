@@ -1,516 +1,567 @@
-﻿# -*- coding: utf-8 -*-
+﻿# app/app.py
 # AdmitRank — Train • Predict • Explain
-# Two screens (tabs), richer visuals, strict Top-K from prediction CSV only,
-# tolerant PDF-ZIP parsing.
+# Two-screen UI with Train & Predict tabs
+# - Train: fit a model on any historical CSV, evaluate on 10% holdout, save model in session
+# - Predict: upload a new CSV, (optionally) upload a ZIP of PDFs (SOP/LOR/CV), compute tabular prob,
+#            doc score (optional), fuse with alpha, and show Top-K strictly from this prediction set.
+# - Robust to missing PDFs: if a PDF is missing, tabular score is used as-is.
 
 import io
 import re
 import zipfile
-from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+import warnings
+from typing import List, Optional, Tuple
 
 import numpy as np
 import pandas as pd
 import streamlit as st
-
-# sklearn
-from sklearn.model_selection import train_test_split
-from sklearn.preprocessing import OneHotEncoder
-from sklearn.impute import SimpleImputer
 from sklearn.compose import ColumnTransformer
-from sklearn.pipeline import Pipeline
+from sklearn.feature_extraction.text import TfidfVectorizer
+from sklearn.impute import SimpleImputer
 from sklearn.metrics import (
-    confusion_matrix, roc_curve, auc,
-    accuracy_score, f1_score, roc_auc_score,
-    r2_score, mean_absolute_error, mean_squared_error
+    accuracy_score,
+    f1_score,
+    mean_absolute_error,
+    mean_squared_error,
+    r2_score,
 )
-from sklearn.linear_model import LogisticRegression, LinearRegression
-from sklearn.ensemble import RandomForestClassifier, RandomForestRegressor
+from sklearn.model_selection import train_test_split
+from sklearn.pipeline import Pipeline
+from sklearn.preprocessing import OneHotEncoder, StandardScaler
 
-# optional XGBoost
+# Models
+from sklearn.linear_model import LinearRegression, LogisticRegression
+from sklearn.ensemble import RandomForestRegressor, RandomForestClassifier
+from sklearn.svm import LinearSVR, LinearSVC
+
+# PDF parsing (tolerant if unavailable on some environments)
 try:
-    from xgboost import XGBClassifier, XGBRegressor  # type: ignore
-    HAS_XGB = True
+    from PyPDF2 import PdfReader  # type: ignore
+    PYPDF_AVAILABLE = True
 except Exception:
-    HAS_XGB = False
+    PYPDF_AVAILABLE = False
 
-# pdf
-from PyPDF2 import PdfReader
-try:
-    from vaderSentiment.vaderSentiment import SentimentIntensityAnalyzer  # type: ignore
-    _VADER = SentimentIntensityAnalyzer()
-except Exception:
-    _VADER = None
+warnings.filterwarnings("ignore")
 
-import matplotlib.pyplot as plt
+st.set_page_config(
+    page_title="AdmitRank — Train • Predict • Explain",
+    page_icon="🎓",
+    layout="wide",
+)
+
+# --------------- helpers -----------------------------------------------------------------
 
 
-# ------------------ Utilities ------------------
-
-def detect_task(y: pd.Series) -> str:
-    """Heuristic: numeric -> regression unless very few unique or binary; else classification."""
-    if pd.api.types.is_numeric_dtype(y):
-        nuniq = y.dropna().nunique()
-        if nuniq <= 5 or set(y.dropna().unique()).issubset({0, 1}):
+def detect_task_type(y: pd.Series) -> str:
+    """
+    Decide whether this is a regression or classification target.
+    - If numeric with many unique values -> regression
+    - If numeric/category with <= 10 unique values -> classification
+    """
+    if y.dtype.kind in "ifu":
+        nun = y.dropna().nunique()
+        if nun <= 10:
             return "classification"
         return "regression"
-    return "classification"
+    else:
+        # non-numeric -> classification
+        return "classification"
 
 
-def split_features(df: pd.DataFrame, features: List[str]) -> Tuple[List[str], List[str]]:
-    num = [c for c in features if pd.api.types.is_numeric_dtype(df[c])]
-    cat = [c for c in features if c not in num]
-    return num, cat
+def build_preprocessor(
+    df: pd.DataFrame, features: List[str]
+) -> Tuple[ColumnTransformer, List[str], List[str], List[str]]:
+    """Create a ColumnTransformer for numeric, categorical and text features."""
+    numeric_cols, cat_cols, text_cols = [], [], []
+    for c in features:
+        if df[c].dtype.kind in "ifu":
+            numeric_cols.append(c)
+        elif df[c].dtype == "object":
+            # crude heuristic: treat long average length columns as text
+            if df[c].dropna().astype(str).str.len().mean() > 20:
+                text_cols.append(c)
+            else:
+                cat_cols.append(c)
+        else:
+            cat_cols.append(c)
 
-
-def build_preprocess(df: pd.DataFrame,
-                     features: List[str],
-                     num_strategy: str = "median",
-                     cat_strategy: str = "most_frequent") -> ColumnTransformer:
-    num_cols, cat_cols = split_features(df, features)
-    transformers = []
-    if num_cols:
-        transformers.append(
-            ("num", SimpleImputer(strategy=num_strategy), num_cols)
+    tfms = []
+    if numeric_cols:
+        tfms.append(
+            ("num", Pipeline(steps=[("imputer", SimpleImputer(strategy="median")),
+                                   ("scaler", StandardScaler())]), numeric_cols)
         )
     if cat_cols:
-        transformers.append(
-            ("cat", Pipeline(steps=[
-                ("imp", SimpleImputer(strategy=cat_strategy)),
-                ("ohe", OneHotEncoder(handle_unknown="ignore"))
-            ]), cat_cols)
+        tfms.append(
+            ("cat", Pipeline(steps=[("imputer", SimpleImputer(strategy="most_frequent")),
+                                   ("oh", OneHotEncoder(handle_unknown="ignore"))]), cat_cols)
         )
-    pre = ColumnTransformer(transformers=transformers, remainder="drop")
-    return pre
-
-
-def make_model(task: str, family: str, random_state: int = 42):
-    """Factory returns estimator per task/family with sensible defaults."""
-    if task == "classification":
-        if family == "Linear/Simple":
-            return LogisticRegression(max_iter=300)
-        if family == "RandomForest":
-            return RandomForestClassifier(n_estimators=300, random_state=random_state)
-        if family == "XGBoost":
-            if HAS_XGB:
-                return XGBClassifier(
-                    n_estimators=400, learning_rate=0.05, max_depth=5,
-                    subsample=0.9, colsample_bytree=0.9, random_state=random_state,
-                    eval_metric="logloss"
-                )
-            st.info("XGBoost not available; using RandomForest instead.")
-            return RandomForestClassifier(n_estimators=300, random_state=random_state)
-    else:
-        if family == "Linear/Simple":
-            return LinearRegression()
-        if family == "RandomForest":
-            return RandomForestRegressor(n_estimators=300, random_state=random_state)
-        if family == "XGBoost":
-            if HAS_XGB:
-                return XGBRegressor(
-                    n_estimators=400, learning_rate=0.05, max_depth=5,
-                    subsample=0.9, colsample_bytree=0.9, random_state=random_state
-                )
-            st.info("XGBoost not available; using RandomForest instead.")
-            return RandomForestRegressor(n_estimators=300, random_state=random_state)
-    return LogisticRegression(max_iter=300) if task == "classification" else LinearRegression()
-
-
-def evaluate(task: str,
-             y_true: np.ndarray,
-             y_pred: np.ndarray,
-             y_proba: Optional[np.ndarray] = None) -> Dict:
-    if task == "classification":
-        out = {
-            "accuracy": accuracy_score(y_true, y_pred),
-            "f1": f1_score(y_true, y_pred, average="weighted"),
-        }
-        try:
-            if y_proba is not None:
-                if y_proba.ndim == 1:
-                    out["roc_auc"] = roc_auc_score(y_true, y_proba)
-                elif y_proba.shape[1] == 2:
-                    out["roc_auc"] = roc_auc_score(y_true, y_proba[:, 1])
-        except Exception:
-            pass
-        return out
-    else:
-        return {
-            "r2": r2_score(y_true, y_pred),
-            "mae": mean_absolute_error(y_true, y_pred),
-            "rmse": float(np.sqrt(mean_squared_error(y_true, y_pred)))
-        }
-
-
-# ------------------ Tolerant PDF ZIP ------------------
-
-PDF_PAT = re.compile(
-    r"^(?P<key>[\w\-]+)_(?P<kind>SOP|CV|LOR\d?)"
-    r"(?:\.(?P<ext>pdf))?$",
-    re.IGNORECASE
-)
-
-
-def build_doc_index_from_zip(zip_file, key_regex: re.Pattern = PDF_PAT):
-    """
-    Build { key: {"SOP":[bytes], "CV":[bytes], "LOR":[bytes]} } from a ZIP.
-    Tolerant: allow names without .pdf, accept LOR/LOR1/LOR2. Skip bad names with a warning.
-    """
-    idx: Dict[str, Dict[str, List[bytes]]] = {}
-    skipped = []
-
-    try:
-        zf = zipfile.ZipFile(io.BytesIO(zip_file.read()))
-    except zipfile.BadZipFile:
-        raise ValueError("Uploaded file is not a valid ZIP.")
-
-    for info in zf.infolist():
-        if info.is_dir():
-            continue
-        name = Path(info.filename).name
-        m = key_regex.match(name) or key_regex.match(Path(name).stem)
-        if not m:
-            skipped.append(name)
-            continue
-
-        key = m.group("key")
-        kind = m.group("kind").upper()
-        kind_base = "LOR" if kind.startswith("LOR") else kind
-
-        try:
-            b = zf.read(info)
-        except Exception:
-            skipped.append(name)
-            continue
-
-        entry = idx.setdefault(key, {"SOP": [], "CV": [], "LOR": []})
-        entry[kind_base].append(b)
-
-    if skipped:
-        st.warning(
-            "Some files were skipped due to unrecognized names. Use `<KEY>_SOP.pdf`, "
-            "`<KEY>_CV.pdf`, `<KEY>_LOR.pdf` (or `_LOR1.pdf`, `_LOR2.pdf`).\n"
-            f"Skipped: {', '.join(skipped[:10])}{' …' if len(skipped) > 10 else ''}"
+    if text_cols:
+        tfms.append(
+            ("txt", Pipeline(steps=[("tfidf", TfidfVectorizer(max_features=4000, ngram_range=(1, 2)))]),
+             # ColumnTransformer expects 1D input for Tfidf: use 'passthrough' later via custom selector
+             # We'll use a wrapper that picks .values.ravel() later via a FunctionTransformer,
+             # but a simpler route is to combine text columns into one string.
+             # So here we just remember text cols, and we will concatenate in a new column before fitting.
+             text_cols)
         )
 
-    if not idx:
-        raise ValueError("No valid SOP/LOR/CV PDFs were found in the ZIP.")
-    return idx
+    preprocessor = ColumnTransformer(tfms, remainder="drop", verbose_feature_names_out=False)
+    return preprocessor, numeric_cols, cat_cols, text_cols
 
 
-def _pdf_bytes_to_text(b: bytes) -> str:
-    txt = []
-    try:
-        with io.BytesIO(b) as bio:
-            reader = PdfReader(bio)
-            for pg in reader.pages:
-                try:
-                    txt.append(pg.extract_text() or "")
-                except Exception:
-                    continue
-    except Exception:
-        return ""
-    return "\n".join(txt)
-
-
-def score_text_simple(text: str) -> float:
-    """Heuristic [0,1] score based on length + sentiment (if VADER present)."""
-    if not text:
-        return 0.0
-    n_words = max(1, len(text.split()))
-    len_score = np.tanh(n_words / 300.0)
-    sent_score = 0.5
-    if _VADER is not None:
-        try:
-            s = _VADER.polarity_scores(text)["compound"]
-            sent_score = 0.5 + 0.5 * s
-        except Exception:
-            pass
-    raw = 0.7 * len_score + 0.3 * sent_score
-    return float(np.clip(raw, 0.0, 1.0))
-
-
-def score_docs_index(idx: Dict[str, Dict[str, List[bytes]]]) -> Dict[str, float]:
-    out = {}
-    for key, groups in idx.items():
-        scores = []
-        for kind in ("SOP", "LOR", "CV"):
-            for b in groups.get(kind, []):
-                t = _pdf_bytes_to_text(b)
-                scores.append(score_text_simple(t))
-        out[key] = float(np.mean(scores)) if scores else 0.0
+def concat_text_columns(df: pd.DataFrame, text_cols: List[str]) -> pd.DataFrame:
+    """Concatenate multiple text columns into a single '___TEXT___' column for TF-IDF."""
+    if not text_cols:
+        return df
+    joined = df[text_cols].astype(str).apply(lambda r: " | ".join(r.values), axis=1)
+    out = df.copy()
+    out["___TEXT___"] = joined
+    # swap text_cols list to the single combined column
     return out
 
 
-# ------------------ Streamlit UI ------------------
+def choose_model(task: str, family: str):
+    """
+    Pick a light-weight scikit-learn model family.
+    family in {"Linear", "Tree", "SVM"}.
+    """
+    if task == "regression":
+        if family == "Linear":
+            return LinearRegression()
+        if family == "SVM":
+            # keep it simple, bounded complexity
+            return LinearSVR(random_state=42)
+        # default tree
+        return RandomForestRegressor(n_estimators=150, random_state=42)
 
-st.set_page_config(page_title="AdmitRank — Train • Predict • Explain", layout="wide")
-st.title("AdmitRank — Train • Predict • Explain")
-st.caption(
-    "Upload any historical CSV to train, then predict on a new CSV. "
-    "Optionally add a ZIP of SOP/LOR/CV PDFs named like `1234_SOP.pdf`, "
-    "`1234_LOR1.pdf`, `1234_CV.pdf` (extension optional) where `1234` matches a key column."
-)
+    # classification
+    if family == "Linear":
+        # liblinear supports small/medium datasets well
+        return LogisticRegression(max_iter=1000, solver="liblinear")
+    if family == "SVM":
+        # use linear svc; no probability => we will calibrate to decision_function
+        return LinearSVC()
+    # default tree
+    return RandomForestClassifier(n_estimators=200, random_state=42)
 
-tabs = st.tabs(["Train", "Predict"])
 
-# Session variables
+def preds_to_probability(task: str, model, X) -> np.ndarray:
+    """
+    Produce probabilities in [0, 1].
+    - classification: prefer predict_proba if available; else map decision_function to (0,1) via logistic.
+    - regression: min-max normalize predictions row-wise to [0,1] (per batch).
+    """
+    if task == "classification":
+        if hasattr(model, "predict_proba"):
+            proba = model.predict_proba(X)
+            if proba.shape[1] == 1:
+                # weird edge-case: single column, treat as positive prob
+                return proba.ravel()
+            # assume positive class is the last column by convention
+            return proba[:, -1]
+        # fallback: decision_function -> logistic squashing
+        if hasattr(model, "decision_function"):
+            s = model.decision_function(X)
+            return 1 / (1 + np.exp(-s))
+        # last resort: predict labels, map to {0,1}
+        labs = model.predict(X)
+        # try to coerce strings like "YES"/"NO"
+        if labs.dtype.kind in "OUS":
+            return np.where(labs.astype(str).str.upper().isin(["1", "YES", "Y", "TRUE"]), 1.0, 0.0)
+        return (labs == 1).astype(float)
+
+    # regression
+    yhat = model.predict(X).astype(float)
+    # min-max scale within this batch (avoid /0)
+    mn, mx = np.nanmin(yhat), np.nanmax(yhat)
+    if mx - mn < 1e-9:
+        return np.clip((yhat - mn), 0, 1)
+    return np.clip((yhat - mn) / (mx - mn), 0, 1)
+
+
+def parse_pdf_text(file_bytes: bytes) -> str:
+    """Extract text from a PDF bytes object. Return empty string if parsing fails or library missing."""
+    if not PYPDF_AVAILABLE:
+        return ""
+    try:
+        reader = PdfReader(io.BytesIO(file_bytes))
+        text = []
+        for page in reader.pages:
+            try:
+                text.append(page.extract_text() or "")
+            except Exception:
+                pass
+        return "\n".join(text).strip()
+    except Exception:
+        return ""
+
+
+def simple_doc_score(text: str) -> float:
+    """
+    Very light heuristic scoring for docs:
+    - normalize length
+    - reward presence of positive keywords
+    """
+    if not text:
+        return np.nan
+    l = len(text)
+    # length score
+    length_score = np.tanh(l / 5000.0)  # saturates ~1 for long docs
+
+    textU = text.lower()
+    kws = ["research", "publication", "internship", "award", "project", "paper"]
+    kw_score = min(sum(1 for k in kws if k in textU) / 6.0, 1.0)
+
+    score = 0.7 * length_score + 0.3 * kw_score
+    return float(np.clip(score, 0.0, 1.0))
+
+
+def build_doc_index_from_zip(zip_bytes: bytes) -> dict:
+    """
+    Read a ZIP and index files by ID & type (SOP/LOR/CV). We accept case-insensitive names like:
+        1234_SOP.pdf, 1234_LOR.pdf, 1234_LOR1.pdf, 1234_CV.pdf
+    Extension is optional in the regex, but we'll only actually parse PDFs.
+    Returns: { id -> {"SOP": [bytes,...], "LOR": [bytes,...], "CV": [bytes,...]} }
+    """
+    index = {}
+    try:
+        with zipfile.ZipFile(io.BytesIO(zip_bytes)) as z:
+            for n in z.namelist():
+                base = n.split("/")[-1]  # ignore folder levels
+                m = re.match(r"^(.+?)_(SOP|LOR\d*|LOR|CV)(?:\.[A-Za-z0-9]+)?$", base, flags=re.IGNORECASE)
+                if not m:
+                    continue
+                applicant_id = str(m.group(1))
+                typ = m.group(2).upper()
+                if typ.startswith("LOR"):
+                    typ = "LOR"
+                # only accept PDFs or files we can read as bytes -> parse_pdf_text will handle empties
+                try:
+                    data = z.read(n)
+                except Exception:
+                    continue
+                index.setdefault(applicant_id, {}).setdefault(typ, []).append(data)
+    except Exception:
+        return {}
+    return index
+
+
+def score_docs_for_row(applicant_id: str, doc_index: dict) -> float:
+    """Average simple_doc_score over all available docs for that applicant. Return NaN if none."""
+    if doc_index is None or applicant_id not in doc_index:
+        return np.nan
+    texts = []
+    for typ in ("SOP", "LOR", "CV"):
+        for b in doc_index[applicant_id].get(typ, []):
+            txt = parse_pdf_text(b)
+            if txt:
+                texts.append(txt)
+    if not texts:
+        return np.nan
+    ss = [simple_doc_score(t) for t in texts if t]
+    if not ss:
+        return np.nan
+    return float(np.nanmean(ss))
+
+
+def fuse_scores(tab: float, doc: float, alpha: float) -> float:
+    """If doc is NaN -> return tab. Else weighted fusion."""
+    if np.isnan(doc):
+        return float(tab)
+    return float(alpha * tab + (1.0 - alpha) * doc)
+
+
+def small_feature_importance(model, feature_names: List[str]) -> pd.DataFrame:
+    """Light-weight feature importance (for tree) or coefficients (for linear)."""
+    try:
+        if hasattr(model, "feature_importances_"):
+            vals = model.feature_importances_
+            return pd.DataFrame({"feature": feature_names, "importance": vals}).sort_values(
+                "importance", ascending=False
+            )
+        if hasattr(model, "coef_"):
+            co = model.coef_
+            if co.ndim > 1:
+                co = co.ravel()
+            vals = np.abs(co)
+            return pd.DataFrame({"feature": feature_names, "importance": vals}).sort_values(
+                "importance", ascending=False
+            )
+    except Exception:
+        pass
+    return pd.DataFrame(columns=["feature", "importance"])
+
+
+# --------------- session state ------------------------------------------------------------
+
 if "trained" not in st.session_state:
     st.session_state.trained = False
-    st.session_state.pipe = None
+if "model" not in st.session_state:
+    st.session_state.model = None
+if "task" not in st.session_state:
     st.session_state.task = None
-    st.session_state.features = None
+if "features" not in st.session_state:
+    st.session_state.features = []
+if "target" not in st.session_state:
     st.session_state.target = None
-    st.session_state.metrics = None
-    st.session_state.family = None
-    st.session_state.train_df_preview = None
+if "id_col" not in st.session_state:
+    st.session_state.id_col = None
+if "preprocessor" not in st.session_state:
+    st.session_state.preprocessor = None
+if "train_metrics" not in st.session_state:
+    st.session_state.train_metrics = {}
+if "train_cols_text" not in st.session_state:
+    st.session_state.train_cols_text = []
+if "train_feature_names_out" not in st.session_state:
+    st.session_state.train_feature_names_out = []
+if "doc_index_train" not in st.session_state:
+    st.session_state.doc_index_train = None
 
+# --------------- UI ----------------------------------------------------------------------
 
-# ------------------ TRAIN TAB ------------------
-with tabs[0]:
-    st.header("Train a model")
+st.title("AdmitRank — Train • Predict • Explain")
+
+st.write(
+    """
+Upload any **historical CSV** to **train**, then predict on a **new CSV**.  
+Optionally add a **ZIP of SOP/LOR/CV PDFs** named like `1234_SOP.pdf`, `1234_LOR1.pdf`, `1234_CV.pdf`
+(**extension is optional** in the match), where `1234` matches a key column of your CSV.  
+Missing PDFs are OK — the system will simply use the tabular model.
+"""
+)
+
+tab_train, tab_predict = st.tabs(["Train", "Predict"])
+
+# ------------------------------------------------------------------------------------------
+# Train tab
+# ------------------------------------------------------------------------------------------
+with tab_train:
+    st.subheader("Train a model")
+
     up = st.file_uploader("Upload historical training CSV", type=["csv"], key="train_csv")
-    if up:
+
+    if up is not None:
         df_hist = pd.read_csv(up)
-        st.session_state.train_df_preview = df_hist.head(10)
-        st.dataframe(st.session_state.train_df_preview, use_container_width=True)
+        st.dataframe(df_hist.head(12), use_container_width=True)
 
-        target = st.selectbox("Target column", options=list(df_hist.columns))
-        default_feats = [c for c in df_hist.columns if c != target]
-        features = st.multiselect("Feature columns", options=list(df_hist.columns), default=default_feats)
+        # choose target & features
+        cols = df_hist.columns.tolist()
+        target_col = st.selectbox("Target column", cols, index=len(cols) - 1)
+        # id col guess
+        id_guess = None
+        for k in ["applicant_id", "Serial No.", "Serial No", "Serial", "id", "ID"]:
+            if k in cols:
+                id_guess = k
+                break
+        id_col = st.selectbox("ID column (for docs matching)", [None] + cols, index=([None] + cols).index(id_guess) if id_guess else 0)
 
-        if features:
-            task = detect_task(df_hist[target])
-            st.info(f"Detected task: **{task}**")
-        else:
-            task = "classification"
+        default_features = [c for c in cols if c != target_col]
+        feat_cols = st.multiselect("Feature columns", default_features, default=default_features)
 
-        family = st.selectbox(
-            "Model family",
-            ["Linear/Simple", "RandomForest", "XGBoost" if HAS_XGB else "Linear/Simple"],
-            index=1 if task == "classification" else 0
-        )
+        family = st.selectbox("Model family", ["Tree", "Linear", "SVM"], index=0)
+        test_size = st.slider("Test size (holdout)", 0.05, 0.4, 0.1, 0.05)
 
-        c1, c2, c3 = st.columns(3)
-        with c1:
-            num_strategy = st.selectbox("Numeric impute", ["median", "mean", "most_frequent"], index=0)
-        with c2:
-            cat_strategy = st.selectbox("Categorical impute", ["most_frequent", "constant"], index=0)
-        with c3:
-            test_size = st.slider("Hold-out test size", 0.05, 0.30, 0.10, step=0.01)
-
-        if st.button("Train"):
-            if not features:
-                st.error("Please choose at least one feature.")
-            else:
-                X = df_hist[features].copy()
-                y = df_hist[target].copy()
-
-                X_tr, X_te, y_tr, y_te = train_test_split(
-                    X, y, test_size=test_size, random_state=42,
-                    stratify=y if detect_task(y) == "classification" else None
+        # Build training DF for TF-IDF: if multiple short text cols, we will concatenate them.
+        # We'll detect text columns and build preprocessor; but first we concatenate text columns.
+        pre, num_cols, cat_cols, text_cols = build_preprocessor(df_hist, feat_cols)
+        df_hist_aug = concat_text_columns(df_hist, text_cols)
+        # If we concatenated, swap text cols list to single column
+        if text_cols:
+            text_cols = ["___TEXT___"]
+            # need to rebuild preprocessor with the single text column
+            tfms = []
+            if num_cols:
+                tfms.append(
+                    ("num", Pipeline(steps=[("imputer", SimpleImputer(strategy="median")),
+                                           ("scaler", StandardScaler())]), num_cols)
                 )
+            if cat_cols:
+                tfms.append(
+                    ("cat", Pipeline(steps=[("imputer", SimpleImputer(strategy="most_frequent")),
+                                           ("oh", OneHotEncoder(handle_unknown="ignore"))]), cat_cols)
+                )
+            tfms.append(("txt", Pipeline(steps=[("tfidf", TfidfVectorizer(max_features=4000, ngram_range=(1, 2)))]), text_cols))
+            pre = ColumnTransformer(tfms, remainder="drop", verbose_feature_names_out=False)
 
-                pre = build_preprocess(df_hist, features, num_strategy, cat_strategy)
-                est = make_model(task, family)
-                pipe = Pipeline(steps=[("pre", pre), ("model", est)])
-                pipe.fit(X_tr, y_tr)
+        X = df_hist_aug[feat_cols if "___TEXT___" not in df_hist_aug.columns else (list(set(feat_cols) - set(text_cols)) + text_cols)]
+        y = df_hist[target_col]
+        task = detect_task_type(y)
 
-                # Evaluate
-                st.subheader("Hold-out evaluation")
-                if task == "classification":
-                    y_pred = pipe.predict(X_te)
-                    try:
-                        y_proba = pipe.predict_proba(X_te)
-                    except Exception:
-                        y_proba = None
-                    metrics = evaluate(task, y_te, y_pred, y_proba)
-                    ms = f"Accuracy: {metrics['accuracy']:.3f} | F1: {metrics['f1']:.3f}"
-                    if "roc_auc" in metrics:
-                        ms += f" | AUC: {metrics['roc_auc']:.3f}"
-                    st.success(ms)
+        # split
+        X_tr, X_te, y_tr, y_te = train_test_split(X, y, test_size=test_size, random_state=42, stratify=y if task == "classification" else None)
 
-                    # Confusion matrix
-                    fig, ax = plt.subplots(1, 2, figsize=(12, 4))
-                    cm = confusion_matrix(y_te, y_pred)
-                    ax[0].imshow(cm, cmap="Blues")
-                    ax[0].set_title("Confusion matrix")
-                    ax[0].set_xlabel("Predicted")
-                    ax[0].set_ylabel("True")
-                    for (i, j), v in np.ndenumerate(cm):
-                        ax[0].text(j, i, str(v), ha="center", va="center")
+        model = choose_model(task, family)
+        pipe = Pipeline([("pre", pre), ("model", model)])
 
-                    # ROC curve (binary only)
-                    if y_proba is not None and (
-                        (y_proba.ndim == 1) or (y_proba.ndim == 2 and y_proba.shape[1] == 2)
-                    ):
-                        if y_proba.ndim == 2:
-                            scores = y_proba[:, 1]
-                        else:
-                            scores = y_proba
-                        fpr, tpr, _ = roc_curve(y_te, scores)
-                        roc_auc = auc(fpr, tpr)
-                        ax[1].plot(fpr, tpr, label=f"AUC={roc_auc:.3f}")
-                        ax[1].plot([0, 1], [0, 1], "--", color="gray")
-                        ax[1].set_title("ROC curve")
-                        ax[1].set_xlabel("FPR")
-                        ax[1].set_ylabel("TPR")
-                        ax[1].legend()
-                    else:
-                        ax[1].axis("off")
+        # fit
+        pipe.fit(X_tr, y_tr)
 
-                    st.pyplot(fig)
+        # evaluate
+        if task == "classification":
+            yhat = pipe.predict(X_te)
+            acc = accuracy_score(y_te, yhat)
+            f1 = f1_score(y_te, yhat, average="binary" if y.dropna().nunique() == 2 else "macro")
+            st.success(f"Classification — Accuracy: **{acc:.3f}**, F1: **{f1:.3f}** on {len(y_te)} rows")
+            st.caption("Tip: feature importances / coefficients (if available) shown below.")
+        else:
+            pred = pipe.predict(X_te)
+            rmse = mean_squared_error(y_te, pred, squared=False)
+            mae = mean_absolute_error(y_te, pred)
+            r2 = r2_score(y_te, pred)
+            st.success(f"Regression — RMSE: **{rmse:.3f}**, MAE: **{mae:.3f}**, R²: **{r2:.3f}** on {len(y_te)} rows")
 
-                else:
-                    y_pred = pipe.predict(X_te)
-                    metrics = evaluate(task, y_te, y_pred)
-                    st.success(f"R²: {metrics['r2']:.3f} | MAE: {metrics['mae']:.3f} | RMSE: {metrics['rmse']:.3f}")
+        # feature importance (if available)
+        try:
+            # names out:
+            try:
+                f_out = pipe[:-1].get_feature_names_out()
+            except Exception:
+                f_out = feat_cols
+            imp = small_feature_importance(pipe[-1], list(f_out))
+            if not imp.empty:
+                st.write("Top features / coefficients")
+                st.dataframe(imp.head(20), use_container_width=True)
+        except Exception:
+            pass
 
-                    # Residuals
-                    res = y_te - y_pred
-                    fig, ax = plt.subplots(1, 2, figsize=(12, 4))
-                    ax[0].scatter(y_pred, res, alpha=0.6)
-                    ax[0].axhline(0, color="red", ls="--")
-                    ax[0].set_title("Residuals vs Prediction")
-                    ax[0].set_xlabel("Prediction")
-                    ax[0].set_ylabel("Residual")
+        # cache into session
+        st.session_state.trained = True
+        st.session_state.model = pipe
+        st.session_state.task = task
+        st.session_state.features = feat_cols
+        st.session_state.target = target_col
+        st.session_state.id_col = id_col
 
-                    ax[1].hist(res, bins=20, color="#5b9bd5")
-                    ax[1].set_title("Residuals histogram")
-                    st.pyplot(fig)
+        st.success("Model trained and stored in session. Switch to the **Predict** tab to score a new CSV.")
 
-                # Feature importance / coefficients
-                st.subheader("Global feature importance")
-                try:
-                    model = pipe.named_steps["model"]
-                    # If tree-based
-                    if hasattr(model, "feature_importances_"):
-                        # Get final feature names after preprocessing
-                        cols = []
-                        pre: ColumnTransformer = pipe.named_steps["pre"]
-                        for name, trans, cols_sel in pre.transformers_:
-                            if name == "cat":
-                                ohe = trans.named_steps["ohe"]
-                                cols.extend(list(ohe.get_feature_names_out(cols_sel)))
-                            elif name == "num":
-                                cols.extend(cols_sel)
-                        imp = pd.Series(model.feature_importances_, index=cols).sort_values(ascending=False)[:20]
-                        st.bar_chart(imp)
-                    elif hasattr(model, "coef_"):
-                        coef = np.ravel(model.coef_)
-                        pre: ColumnTransformer = pipe.named_steps["pre"]
-                        cols = []
-                        for name, trans, cols_sel in pre.transformers_:
-                            if name == "cat":
-                                ohe = trans.named_steps["ohe"]
-                                cols.extend(list(ohe.get_feature_names_out(cols_sel)))
-                            elif name == "num":
-                                cols.extend(cols_sel)
-                        imp = pd.Series(coef, index=cols).sort_values(key=np.abs, ascending=False)[:20]
-                        st.bar_chart(imp)
-                    else:
-                        st.info("This model does not expose a standard importance/coefficient interface.")
-                except Exception as e:
-                    st.info(f"Feature importance unavailable: {e}")
-
-                # Save to session
-                st.session_state.trained = True
-                st.session_state.pipe = pipe
-                st.session_state.task = task
-                st.session_state.features = features
-                st.session_state.target = target
-                st.session_state.metrics = metrics
-                st.session_state.family = family
-
-
-# ------------------ PREDICT TAB ------------------
-with tabs[1]:
-    st.header("Predict on a new applicants CSV")
+# ------------------------------------------------------------------------------------------
+# Predict tab
+# ------------------------------------------------------------------------------------------
+with tab_predict:
+    st.subheader("Predict on a new applicants CSV")
 
     if not st.session_state.trained:
         st.info("Train a model first in the **Train** tab.")
     else:
-        # Fusion and Top-K
-        c1, c2 = st.columns([2, 1])
-        with c1:
-            st.markdown("**Fusion weight α (0 → documents only, 1 → tabular only)**")
-            alpha = st.slider("α", 0.0, 1.0, 0.70, step=0.05, label_visibility="collapsed")
-        with c2:
-            top_k = st.number_input("Top-K (overall)", min_value=1, max_value=100, value=5, step=1)
+        col_left, col_right = st.columns([2, 1])
 
-        pred_file = st.file_uploader("Upload applicants CSV (prediction set)", type=["csv"], key="pred_csv")
-        doc_zip = st.file_uploader("Optional: ZIP of SOP/LOR/CV PDFs", type=["zip"], key="doc_zip")
+        with col_left:
+            pred_up = st.file_uploader("Upload NEW applicants CSV", type=["csv"], key="pred_csv")
 
-        if pred_file is not None:
-            # IMPORTANT: df_pred comes ONLY from the uploaded prediction CSV
-            df_pred = pd.read_csv(pred_file)
+        with col_right:
+            alpha = st.slider("Fusion weight α (tabular vs docs)", 0.0, 1.0, 0.7, 0.05)
+            k_overall = st.number_input("Top-K overall", min_value=1, max_value=1000, value=5, step=1)
+
+        # Optional ZIP of PDFs
+        docs_zip = st.file_uploader(
+            "Optional: ZIP of SOP/LOR/CV PDFs (e.g., 1234_SOP.pdf, 1234_LOR1.pdf, 1234_CV.pdf)",
+            type=["zip"],
+            key="pred_docs_zip",
+        )
+
+        doc_index = None
+        if docs_zip is not None:
+            doc_index = build_doc_index_from_zip(docs_zip.getvalue())
+        # else: None -> scoring will skip docs
+
+        if pred_up is not None:
+            df_pred = pd.read_csv(pred_up)
+
+            # check features presence
+            missing_feats = [c for c in st.session_state.features if c not in df_pred.columns]
+            # allow text concatenation column if used
+            text_needed = "___TEXT___" in getattr(st.session_state.model["pre"], "feature_names_in_", [])
+            if text_needed and "___TEXT___" not in df_pred.columns:
+                # We'll re-concat if any text cols existed in training -> assume same in predict
+                # We don't know the original text cols list here, so best-effort:
+                obj_cols = [c for c in df_pred.columns if df_pred[c].dtype == "object"]
+                if obj_cols:
+                    df_pred = concat_text_columns(df_pred, obj_cols)
+                    if "___TEXT___" not in df_pred.columns:
+                        st.warning("Could not reconstruct text column for TF-IDF. Predictions may be off.")
+                else:
+                    st.warning("No object columns to rebuild TF-IDF. Predictions may be off.")
+
+            if missing_feats:
+                st.error(f"Prediction data is missing required features: {missing_feats}")
+                st.stop()
+
+            st.write("Preview")
             st.dataframe(df_pred.head(10), use_container_width=True)
 
-            missing = [c for c in st.session_state.features if c not in df_pred.columns]
-            if missing:
-                st.error(f"Prediction CSV is missing columns used by the model: {missing}")
+            id_col = st.session_state.id_col
+            if id_col is None or id_col not in df_pred.columns:
+                st.warning("No ID column configured or present; doc matching by ID will be skipped.")
+
+            # compute tabular probabilities
+            model = st.session_state.model
+            task = st.session_state.task
+
+            Xp = df_pred[st.session_state.features if "___TEXT___" not in df_pred.columns else (list(set(st.session_state.features) - {"___TEXT___"}) | {"___TEXT___"})]
+            try:
+                p_tab = preds_to_probability(task, model, Xp)
+            except Exception as e:
+                st.error(f"Prediction failed: {e}")
+                st.stop()
+
+            out = df_pred.copy()
+            out["p_tabular"] = p_tab
+
+            # doc scoring (optional)
+            doc_scores = []
+            if id_col and doc_index:
+                for _, r in out.iterrows():
+                    doc_scores.append(score_docs_for_row(str(r[id_col]), doc_index))
             else:
-                pipe = st.session_state.pipe
-                task = st.session_state.task
-                Xp = df_pred[st.session_state.features].copy()
+                doc_scores = [np.nan] * len(out)
+            out["doc_score"] = doc_scores
 
-                # Tabular probability/score
-                if task == "classification":
-                    try:
-                        proba = pipe.predict_proba(Xp)
-                        p_tab = proba[:, 1] if proba.shape[1] == 2 else proba.max(axis=1)
-                    except Exception:
-                        y_pred = pipe.predict(Xp)
-                        mode = pd.Series(y_pred).mode().iloc[0]
-                        p_tab = (y_pred == mode).astype(float)
+            # fuse
+            out["p_final"] = [
+                fuse_scores(t, d, alpha) for t, d in zip(out["p_tabular"].values, out["doc_score"].values)
+            ]
+
+            # small histogram viz
+            import matplotlib.pyplot as plt
+
+            st.markdown("#### Score distribution (p_final)")
+            fig, ax = plt.subplots(figsize=(6, 2))
+            ax.hist(out["p_final"].values, bins=12)
+            ax.set_xlabel("p_final")
+            ax.set_ylabel("count")
+            st.pyplot(fig, use_container_width=True)
+
+            # --------------------------- TOP-K (strictly from THIS PREDICTION CSV) ----------------------
+            # overall
+            st.markdown("### Top-K applicants (overall)")
+            top_overall = out.sort_values("p_final", ascending=False).head(int(k_overall))
+            # show main columns + scores
+            show_cols = []
+            # prefer common numeric columns
+            for c in ["Serial No.", "Serial No", "Serial", "applicant_id", "ID", "id"]:
+                if c in out.columns:
+                    show_cols.append(c)
+                    break
+            score_cols = [c for c in out.columns if c not in ["p_tabular", "doc_score", "p_final"] and out[c].dtype.kind in "ifu"]
+            # choose a short set to show
+            base_cols = [c for c in score_cols if c not in show_cols][:8]
+            show = list(dict.fromkeys(show_cols + base_cols + ["p_tabular", "doc_score", "p_final"]))
+            st.dataframe(top_overall[show], use_container_width=True)
+
+            # Group-wise Top-K (optional)
+            st.markdown("### Optional: Top-K per group")
+            grp_col = st.selectbox("Group by column (optional)", [None] + out.columns.tolist(), index=0)
+            k_group = st.number_input("K per group", min_value=1, max_value=1000, value=1, step=1, key="k_group")
+            if grp_col:
+                gb = []
+                for g, df_g in out.groupby(grp_col):
+                    df_g = df_g.sort_values("p_final", ascending=False).head(int(k_group))
+                    gb.append(df_g)
+                if gb:
+                    per_group = pd.concat(gb, axis=0)
+                    st.dataframe(per_group[show], use_container_width=True)
                 else:
-                    yhat = pipe.predict(Xp).astype(float)
-                    lo, hi = np.nanmin(yhat), np.nanmax(yhat)
-                    p_tab = (yhat - lo) / (hi - lo + 1e-9)
+                    st.info("No groups found.")
 
-                df_out = df_pred.copy()
-                df_out["p_tabular"] = p_tab
-
-                # Document score by key (ONLY map to rows present in df_pred)
-                if doc_zip is not None:
-                    key_col = st.selectbox(
-                        "Select key column matching PDF names (e.g., 'Serial No.')",
-                        options=list(df_pred.columns),
-                        help="Only rows in this prediction CSV are used."
-                    )
-                    try:
-                        idx = build_doc_index_from_zip(doc_zip)
-                        by_key = score_docs_index(idx)  # dict
-                        df_out["doc_score"] = df_pred[key_col].astype(str).map(
-                            lambda k: by_key.get(str(k), np.nan)
-                        )
-                    except Exception as e:
-                        st.error(f"Could not parse ZIP: {e}")
-                        df_out["doc_score"] = np.nan
-                else:
-                    df_out["doc_score"] = np.nan
-
-                # Fusion per-row (if doc missing for a row, use tabular for that row)
-                doc_fill = df_out["doc_score"].fillna(df_out["p_tabular"])
-                df_out["p_final"] = alpha * df_out["p_tabular"] + (1 - alpha) * doc_fill
-
-                # ------- Visuals for prediction set -------
-                st.subheader("Prediction score distribution")
-                fig, ax = plt.subplots(figsize=(6, 3))
-                ax.hist(df_out["p_final"], bins=20, color="#5b9bd5")
-                ax.set_xlabel("p_final")
-                ax.set_ylabel("Count")
-                ax.set_title("Histogram of predicted scores")
-                st.pyplot(fig)
-
-                # ------- Strict Top-K from prediction CSV only -------
-                st.subheader("Top-K applicants (overall)")
-                top_overall = df_out.sort_values("p_final", ascending=False).head(int(top_k))
-                st.dataframe(top_overall, use_container_width=True)
-
-                st.download_button(
-                    "Download predictions CSV",
-                    data=df_out.to_csv(index=False).encode("utf-8"),
-                    file_name="predictions.csv",
-                    mime="text/csv"
-                )
+            st.caption("Top-K tables above are derived **only from the uploaded prediction CSV** (never from training rows).")
