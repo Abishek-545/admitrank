@@ -1,21 +1,44 @@
-\# AdmitRank — Train • Predict • Explain
+# AdmitRank — Train • Predict • Explain
 
-Link to the app->   https://admitrank-dacysgdughauxleskuuend.streamlit.app/
+📌 [Live App Link](#)  https://admitrank-dacysgdughauxleskuuend.streamlit.app/
+## Overview
+AdmitRank is the **first-ever novel business solution** for universities to automate student admission ranking.  
+Instead of manually screening thousands of applications, universities can quickly predict the **top-K students** based on both **tabular data** (scores, ratings, CGPA, etc.) and **document insights** (SOPs, LORs, CVs).
+
+## Dataset
+- **Training:** Upload any historical CSV dataset.  
+- **Prediction:** Upload a new CSV dataset with the same or extended features.  
+- **Optional:** Add ZIP of SOP/LOR/CV PDFs linked by student IDs.  
+- The system dynamically supports **any number of features** and **different ML models**.
+
+## Key Features
+- 📊 **Flexible CSVs** – Train with N features, predict on dynamic data.  
+- 🤖 **Pluggable ML models** – Any regression/classifier can be used.  
+- 📑 **Document integration** – Link SOP/LOR/CV PDFs to enhance predictions.  
+- 🔝 **Top-K Ranking** – Universities see the best candidates instantly.  
+- 📈 **Visualization** – Probability distributions & student ranking charts.  
+
+## Alpha Fusion
+We combine:
+- **p_tabular** → Score from tabular ML model  
+- **p_doc** → Score from NLP-based document model  
+- **p_final** = α·p_tabular + (1-α)·p_doc  
+
+This **fusion weight (α)** balances tabular vs. document signals for a robust admission decision.
+
+## Business Value 
+- 🚀 Saves **time** and **manual effort** for admission teams.  
+- 🎯 Provides **objective, consistent, and explainable** rankings.  
+- 🌍 Scalable across **all universities** — from small colleges to global institutions.  
+
+---
+
+For quick testing use the dataset available in data folder( data\samples\sample classification dataset or  data\samples\sample regression dataset) 
+     -> Use Admit_train_test to train the model 
+     -> Use Admit_predict to predict applicant's rank
 
 
-A simple end-to-end admissions ranking web app:
-
-\- Train on \*\*any CSV\*\* (numeric, categorical, text)
-
-\- Predict on a new CSV
-
-\- Optional \*\*SOP / LOR / CV PDFs\*\* fusion (name files `<KEY>\_SOP.pdf`, `<KEY>\_LOR1.pdf`, `<KEY>\_CV.pdf`)
-
-\- Choose the \*\*Key column\*\* in the UI to match PDFs with rows
-
-\- Auto-detects \*\*binary / multiclass / regression\*\*, uses \*\*probabilities\*\* for classification
-
-\- Top-K overall + Top-K per group + charts \& feature importance
+🔗 This project demonstrates how **AI + automation** can modernize the admission process and deliver **faster, fairer, and smarter decisions**.
 
 
 
