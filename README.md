@@ -1,5 +1,6 @@
 \# AdmitRank — Train • Predict • Explain
 
+Link to the app->   https://admitrank-dacysgdughauxleskuuend.streamlit.app/
 
 
 A simple end-to-end admissions ranking web app:
