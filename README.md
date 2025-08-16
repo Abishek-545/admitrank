@@ -1,4 +1,24 @@
+
 # AdmitRank — Train • Predict • Explain
+flowchart LR
+    A[Upload training CSV] --> B[Select target & features]
+    B --> C[Choose model family\n(SVM / RF / XGB / Linear...)]
+    C --> D[Set test size & Random Seed]
+    D --> E[Train & evaluate\n(hold-out metrics)]
+    E --> F[Save trained pipeline & schema]
+
+subgraph Prediction
+        G[Upload prediction CSV] --> H[Optional ZIP of PDFs\nSOP/LOR/CV]
+        H --> I[Parse PDFs → doc_score_i\n(missing ok)]
+        G --> J[Tabular model → p_tabular]
+        I --> K[Fusion: p_final = α·p_tabular + (1−α)·doc_score]
+        J --> K
+end
+
+ F -. uses schema & model .-> J
+ K --> L[Top-K per group (or overall)]
+    L --> M[Visualize\n(distributions, feature importances)]
+    M --> N[Export results (CSV)]
 
 📌 [Live App Link](#)  https://admitrank-dacysgdughauxleskuuend.streamlit.app/
 ## Overview
@@ -30,26 +50,6 @@ This **fusion weight (α)** balances tabular vs. document signals for a robust a
 - 🚀 Saves **time** and **manual effort** for admission teams.  
 - 🎯 Provides **objective, consistent, and explainable** rankings.  
 - 🌍 Scalable across **all universities** — from small colleges to global institutions.
-
-flowchart LR
-    A[Upload training CSV] --> B[Select target & features]
-    B --> C[Choose model family\n(SVM / RF / XGB / Linear...)]
-    C --> D[Set test size & Random Seed]
-    D --> E[Train & evaluate\n(hold-out metrics)]
-    E --> F[Save trained pipeline & schema]
-
-    subgraph Prediction
-        G[Upload prediction CSV] --> H[Optional ZIP of PDFs\nSOP/LOR/CV]
-        H --> I[Parse PDFs → doc_score_i\n(missing ok)]
-        G --> J[Tabular model → p_tabular]
-        I --> K[Fusion: p_final = α·p_tabular + (1−α)·doc_score]
-        J --> K
-    end
-
-    F -. uses schema & model .-> J
-    K --> L[Top-K per group (or overall)]
-    L --> M[Visualize\n(distributions, feature importances)]
-    M --> N[Export results (CSV)]
 
 
 ## For quick testing use the dataset available in data folder( data\samples\sample classification dataset or  data\samples\sample regression dataset) 
